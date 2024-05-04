@@ -36,9 +36,14 @@
 #define OBD_TYPE_INJECTION_TIME             (3)
 #define OBD_TYPE_ENGINE_SPEED               (4)
 
+// States
+#define STATE_NOMINAL                       (0)
+#define STATE_WARNING                       (1)
+#define STATE_ALERT                         (2)
+
 // Configurations
 #define CONFIG_SOUND_ENABLED                (1)     // 1: Enabled | 0: Disabled
-#define CONFIG_LIMIT_MAX_INJECTION_TIME     (2.5)
+#define CONFIG_DRAW_CURVE                   (0)     // 1: Enabled | 0: Disabled
 
 
 /** D E C L A R A T I O N S ******************************************************************************************/
@@ -59,9 +64,7 @@ double UDS_engine_speed   = 0.0;
 void setup (void)
 {
   // Debug connection
-  Serial.begin(115200);
-  Serial.print("version : ");
-  Serial.println(VERSION_SW);
+  Serial.begin(500000);
 
   // Initilization
   led_init();
@@ -74,8 +77,8 @@ void loop (void)
 {
   uint8_t data_engine_load[]    = {0x02, 0x01, 0x04, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
   uint8_t data_fuel_trime[]     = {0x02, 0x01, 0x06, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
-  uint8_t data_injection_time[] = {0x03, 0x22, 0x12, 0x8C, 0x00, 0x00, 0x00, 0x00};
-  uint8_t data_engine_speed[]   = {0x02, 0x01, 0x0C, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+  uint8_t data_injection_time[] = {0x03, 0x22, 0x12, 0x8C, 0x00, 0x00, 0x00, 0x00};   //req: 7E0#0322128C00000000  -->  resp: 7E8#0762128C0000099D
+  uint8_t data_engine_speed[]   = {0x02, 0x01, 0x0C, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};   //req: 7DF#02010CAAAAAAAAAA  -->  resp: 7E8#04410C0F18000000
 
   // Read wanted CAN data
   //UDS_engine_load     = obd_read_value(OBD_TYPE_ENGINE_LOAD, 0x7DF, sizeof(data_engine_load), data_engine_load);            // Calculated engine load
@@ -83,34 +86,35 @@ void loop (void)
   UDS_injection_time  = obd_read_value(OBD_TYPE_INJECTION_TIME, 0x7E0, sizeof(data_injection_time), data_injection_time);     // Injection time
   UDS_engine_speed    = obd_read_value(OBD_TYPE_ENGINE_SPEED, 0x7DF, sizeof(data_engine_speed), data_engine_speed);           // Engine speed
 
-  // Play a sound to alert driver from the critical motor state
-  if (obd_critical_motor_state())
+  // If we haven't CAN error
+  if ((UDS_injection_time != -1) && (UDS_engine_speed != -1))
   {
-    sound_alert();
-  }
+    // Play a sound to alert driver from the critical motor state
+    uint8_t motorState = obd_critical_motor_state();
 
-  // Led activity
-  led_activity();
+    if (motorState == STATE_WARNING)
+      sound_warning();
+    else if (motorState == STATE_ALERT)
+      sound_alert();
+
+    // Led activity
+    led_activity();
+  }
 }
 
 
 /** O B D ************************************************************************************************************/
 void obd_init (void)
 {
-  // CAN connection to inject simulated data
-  Serial.print("Attempting to connect to CAN bus ...");
-
   // start the CAN bus at 500 kbps
   if (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK)
   {
-    Serial.println("Starting CAN failed!");
     while (1);
   }
 
   // Configure mode and interruption
   CAN.setMode(MCP_NORMAL);
   pinMode(MCP_INT_PIN, INPUT);
-  Serial.println("CAN connection is established");
 }
 
 /*-------------------------------------------------------------------------------------------------------------------*/
@@ -128,42 +132,49 @@ double obd_read_value (uint8_t _obd_data_type, uint16_t _addr, uint8_t _lenght, 
   for (uint8_t i=0; i<10; i++)
   {
     // "Interrupt" pin check
-    if (!digitalRead(MCP_INT_PIN))
+    while (digitalRead(MCP_INT_PIN));
+
+    // Read can message
+    CAN.readMsgBuf(&rxId, &len, rxBuf);
+
+    // Read CAN buffer only ECU response
+    if (rxId != 0x7E8)
     {
-      // Read can message
-      CAN.readMsgBuf(&rxId, &len, rxBuf);
-
-      // Read CAN buffer only ECU response
-      if (rxId != 0x7E8)
-      {
-        //Serial.print("INVALID ID, REJECTED : ");
-        //Serial.println(rxId, HEX);
-        continue;
-      }
-
-      // Check if it's our frame
-      bool is_invalid_frame = false;
-      for (uint8_t j=2; j<4; j++)
-      {
-        // If we can't find ID, we skip this frame
-        if (rxBuf[j] != _request[j])
-        {
-          is_invalid_frame = true;
-          Serial.println("INVALID FRAME, REJECTED");
-          break;
-        }
-      }
-
-      // If this frame is valid, we return data
-      if (is_invalid_frame == false)
-      {
-        retval = obd_extract_value(_obd_data_type, rxBuf);
-      }
-
-      break;
+      continue;
     }
 
-    delay(30);
+    /* For debug only
+    for (uint8_t k=0; k<6;k++)
+    {
+      Serial.print(rxBuf[k], HEX);
+      Serial.print(" ");
+    }
+    Serial.println(" ");
+    */
+
+    // Check if it's our frame
+    bool is_invalid_frame = false;
+    uint8_t nbPackageToCheck = 2;
+
+    if (_addr == 0x7DF)
+      nbPackageToCheck = 1;
+    
+    for (uint8_t j=2; j<2+nbPackageToCheck; j++)
+    {
+      // If we can't find ID, we skip this frame
+      if (rxBuf[j] != _request[j])
+      {
+        is_invalid_frame = true;
+        break;
+      }
+    }
+
+    // If this frame is valid, we return data
+    if (is_invalid_frame == false)
+    {
+      retval = obd_extract_value(_obd_data_type, rxBuf);
+      break;
+    }
   }
 
   return retval;
@@ -186,8 +197,6 @@ double obd_extract_value (uint8_t _obd_data_type, uint8_t* _data)
       Serial.println("INVALID OBD DATA TYPE");
   }
 
-  Serial.println(retval);
-
   return retval;
 }
 
@@ -203,15 +212,32 @@ void obd_send_packet (uint16_t _addr, uint8_t _lenght, uint8_t* _data)
 }
 
 /*-------------------------------------------------------------------------------------------------------------------*/
-bool obd_critical_motor_state (void)
+uint8_t obd_critical_motor_state (void)
 {
-  bool retval = false;
+  uint8_t retval = STATE_NOMINAL;
+  
+  // Road to ESC issue
+  double trend = (UDS_engine_speed/1000)*pow(UDS_injection_time,UDS_injection_time);
+  if (trend > 13.0)
+    retval = STATE_WARNING;
 
-  if ((UDS_engine_speed > 1500) && (UDS_injection_time > CONFIG_LIMIT_MAX_INJECTION_TIME))
-  {
-    retval = true;
-    //Serial.print("/!\\ CRITICAL MOTOR STAT /!\\");
-  }
+  // Ultimate warning
+  if ((UDS_engine_speed > 2200) && (UDS_injection_time > 2.2))
+    retval = STATE_ALERT;
+
+  // Draw curves
+  #if CONFIG_DRAW_CURVE == 1
+    Serial.print("RPM:");
+    Serial.print(UDS_engine_speed/1000);
+    Serial.print(",INJ:");
+    Serial.print(UDS_injection_time);
+    Serial.print(",trend:");
+    Serial.print(trend);
+    Serial.print(",lvl1:");
+    Serial.print(2);
+    Serial.print(",lvl2:");
+    Serial.println(13);
+  #endif
 
   return retval;
 }
@@ -240,24 +266,45 @@ void sound_init (void)
 
   // Play sound to notify that the box is ready
   #if CONFIG_SOUND_ENABLED == 1
-  tone(PINOUT_OUT_BUZZER, 4000, 250);
-  delay(500);
-  tone(PINOUT_OUT_BUZZER, 4000, 250);
-  delay(500);
+  tone(PINOUT_OUT_BUZZER, 3000, 200);
+  delay(300);
+  tone(PINOUT_OUT_BUZZER, 3000, 200);
+  delay(300);
   #endif
   noTone(PINOUT_OUT_BUZZER);
+}
+
+/*-------------------------------------------------------------------------------------------------------------------*/
+void sound_warning (void)
+{
+  #if CONFIG_SOUND_ENABLED == 1
+  const byte countNotes = 1;
+  int frequences[countNotes] = {
+    4000
+  };
+  int durations[countNotes] = {
+    30
+  };
+
+  for (int i=0; i<countNotes; i++)
+  {
+    tone(PINOUT_OUT_BUZZER, frequences[i], durations[i] * 2);
+    delay(durations[i] * 2);
+    noTone(PINOUT_OUT_BUZZER);
+  }
+  #endif
 }
 
 /*-------------------------------------------------------------------------------------------------------------------*/
 void sound_alert (void)
 {
   #if CONFIG_SOUND_ENABLED == 1
-  const byte countNotes = 8;
+  const byte countNotes = 1;
   int frequences[countNotes] = {
-    4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000
+    4400
   };
   int durations[countNotes] = {
-    30, 30, 30, 30, 30, 30, 30, 30
+    400
   };
 
   for (int i=0; i<countNotes; i++)
